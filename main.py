@@ -86,11 +86,14 @@ class FedoraController:
         self.run_cmd(["ydotool", "key", f"{code}:1", f"{code}:0"])
 
 
-# --- 3. Gesture Classifier & Continuous Volume Slider ---
+# --- 3. Gesture Classifier & Persistent Armed State Machine ---
 class GestureEngine:
+    ARMED_TIMEOUT = 10.0  # Stay armed for 10 seconds of inactivity
+
     def __init__(self):
-        self.state = "IDLE"
+        self.state = "IDLE"  # IDLE -> ARMED -> COOLDOWN -> ARMED
         self.arm_start_time = 0.0
+        self.three_finger_start = 0.0
         self.last_action_time = 0.0
         self.last_active_time = 0.0
         self.pinch_anchor_y = None
@@ -116,12 +119,12 @@ class GestureEngine:
         ])
 
     def _is_three_fingers(self, lm):
-        # Index (8), Middle (12), Ring (16) extended; Pinky (20) curled down
+        # Index (8), Middle (12), Ring (16) clearly up; Pinky (20) folded well below ring tip
         index_up = lm[8].y < lm[6].y
         middle_up = lm[12].y < lm[10].y
         ring_up = lm[16].y < lm[14].y
-        pinky_down = lm[20].y > lm[18].y
-        return index_up and middle_up and ring_up and pinky_down
+        pinky_folded = lm[20].y > lm[19].y or (lm[20].y - lm[16].y) > 0.06
+        return index_up and middle_up and ring_up and pinky_folded
 
     def _dist(self, lm, a: int, b: int) -> float:
         return math.hypot(lm[a].x - lm[b].x, lm[a].y - lm[b].y)
@@ -132,29 +135,34 @@ class GestureEngine:
         wrist_y = self.filter_y(landmarks[0].y, now)
         pinch_y = (landmarks[4].y + landmarks[8].y) / 2.0
 
+        # Brief debounce after an action, then return directly to ARMED
         if self.state == "COOLDOWN":
             if now - self.last_action_time > 0.75:
-                self.state = "IDLE"
+                self.state = "ARMED"
+                self.last_active_time = now
                 self.trajectory.clear()
-            return "COOLDOWN", False
+            return "COOLDOWN (Staying Armed...)", False
 
         if self.state == "IDLE":
             self.pinch_anchor_y = None
+            self.three_finger_start = 0.0
             if self._is_open_palm(landmarks):
                 if self.arm_start_time == 0.0:
                     self.arm_start_time = now
-                elif now - self.arm_start_time >= 0.40:
+                elif now - self.arm_start_time >= 0.35:
                     self.state = "ARMED"
                     self.last_active_time = now
                     self.trajectory.clear()
             else:
                 self.arm_start_time = 0.0
-            return "IDLE (Hold open palm 0.4s to arm)", False
+            return "IDLE (Hold open palm 0.35s to arm)", False
 
         if self.state == "ARMED":
+            # 1. Continuous Pinch + Drag Volume Slider
             index_pinched = self._dist(landmarks, 4, 8) < 0.045
             if index_pinched:
                 self.last_active_time = now
+                self.three_finger_start = 0.0
                 if self.pinch_anchor_y is None:
                     self.pinch_anchor_y = pinch_y
                     return "VOLUME SLIDER: Move hand Up / Down", True
@@ -171,26 +179,33 @@ class GestureEngine:
             else:
                 self.pinch_anchor_y = None
 
-            # Three Fingers (Index + Middle + Ring up, Pinky down) -> Switch Window
+            # 2. Three Fingers (hold 0.15s) -> Switch Window (Brave <-> Spotify)
             if self._is_three_fingers(landmarks):
-                self.os_ctrl.switch_window()
-                self._trigger_cooldown()
-                return "ACTION: Switch Window (Alt+Tab)", False
+                self.last_active_time = now
+                if self.three_finger_start == 0.0:
+                    self.three_finger_start = now
+                elif now - self.three_finger_start >= 0.15:
+                    self.os_ctrl.switch_window()
+                    self._trigger_cooldown()
+                    return "ACTION: Switch Window (Alt+Tab)", False
+                return "HOLDING 3-FINGERS...", False
+            else:
+                self.three_finger_start = 0.0
 
-            # Middle-Finger Pinch -> Toggle Mute
+            # 3. Middle-Finger Pinch -> Toggle Mute
             middle_pinched = self._dist(landmarks, 4, 12) < 0.042
             if middle_pinched and not index_pinched:
                 self.os_ctrl.toggle_mute()
                 self._trigger_cooldown()
                 return "ACTION: Toggle Mute", False
 
-            # Closed Fist -> Play / Pause
+            # 4. Closed Fist -> Play / Pause
             if self._is_fist(landmarks):
                 self.os_ctrl.play_pause()
                 self._trigger_cooldown()
                 return "ACTION: Play / Pause", False
 
-            # Horizontal Flick -> Next / Previous Track
+            # 5. Horizontal Flick -> Next / Previous Track
             self.trajectory.append((wrist_x, wrist_y, now))
             if len(self.trajectory) >= 8:
                 dx = self.trajectory[-1][0] - self.trajectory[0][0]
@@ -205,16 +220,22 @@ class GestureEngine:
                     self._trigger_cooldown()
                     return "ACTION: Previous Track", False
 
-            if now - self.last_active_time > 3.5:
+            # Auto-disarm only after ARMED_TIMEOUT seconds of no gestures
+            remaining = self.ARMED_TIMEOUT - (now - self.last_active_time)
+            if remaining <= 0:
                 self.state = "IDLE"
                 self.arm_start_time = 0.0
+                return "IDLE (Timed out)", False
 
-        return "ARMED (3-Fingers=Switch App | Pinch+Up/Down=Vol | Fist=Pause)", False
+            return f"ARMED ({remaining:.1f}s) | 3-Fingers=Switch | Pinch=Vol", False
+
+        return "IDLE", False
 
     def _trigger_cooldown(self):
         self.state = "COOLDOWN"
         self.last_action_time = time.time()
-        self.arm_start_time = 0.0
+        self.last_active_time = time.time()
+        self.three_finger_start = 0.0
         self.pinch_anchor_y = None
 
 
@@ -269,8 +290,8 @@ def main():
                 i_pt = (int(lm[8].x * w), int(lm[8].y * h))
                 cv2.line(frame, t_pt, i_pt, (0, 220, 255), 3)
 
-        color = (0, 255, 0) if ("ARMED" in status or "VOLUME" in status or "ACTION" in status) else (200, 200, 200)
-        cv2.putText(frame, status, (15, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.58, color, 2)
+        color = (0, 255, 0) if ("ARMED" in status or "VOLUME" in status or "ACTION" in status or "HOLDING" in status) else (200, 200, 200)
+        cv2.putText(frame, status, (15, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.56, color, 2)
 
         bar_x, bar_top, bar_bottom, bar_w = w - 45, 70, h - 50, 20
         bar_h = bar_bottom - bar_top
