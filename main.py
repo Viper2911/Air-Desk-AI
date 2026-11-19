@@ -42,6 +42,22 @@ class FedoraController:
     def run_cmd(cmd: list[str]):
         subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+    def launch_app(self, candidates: list[str]):
+        cmd_str = " || ".join(f"command -v {c} >/dev/null 2>&1 && exec {c}" for c in candidates)
+        self.run_cmd(["bash", "-lc", cmd_str])
+
+    def open_brave(self):
+        self.launch_app(["brave-browser", "brave"])
+
+    def open_spotify(self):
+        cmd_str = (
+            "if command -v spotify >/dev/null 2>&1; then exec spotify; "
+            "elif flatpak info com.spotify.Client >/dev/null 2>&1; then exec flatpak run com.spotify.Client; "
+            "elif command -v gtk-launch >/dev/null 2>&1 && gtk-launch spotify 2>/dev/null; then exit 0; "
+            "else exit 1; fi"
+        )
+        self.run_cmd(["bash", "-lc", cmd_str])
+
     def play_pause(self):
         self.run_cmd(["playerctl", "--player=spotify,%any", "play-pause"])
 
@@ -78,8 +94,8 @@ class FedoraController:
 # --- 3. Gesture Classifier & Persistent Armed State Machine ---
 class GestureEngine:
     ARMED_TIMEOUT = 12.0
-    SWEEP_MIN_DISTANCE = 0.22  # ~22% of frame width for a deliberate palm sweep
-    SWEEP_MAX_WINDOW = 1.0     # Max seconds to complete the sweep
+    SWEEP_MIN_DISTANCE = 0.22
+    SWEEP_MAX_WINDOW = 1.0
 
     def __init__(self):
         self.state = "IDLE"
@@ -112,21 +128,13 @@ class GestureEngine:
         ])
 
     def _check_palm_sweep(self, now: float) -> str | None:
-        """
-        Returns 'NEXT' for right-to-left palm sweep (dx <= -SWEEP_MIN_DISTANCE),
-        'PREV' for left-to-right palm sweep (dx >= +SWEEP_MIN_DISTANCE),
-        or None if not swept far enough yet.
-        """
         while len(self.palm_history) > 1 and (now - self.palm_history[0][1] > self.SWEEP_MAX_WINDOW):
             self.palm_history.popleft()
 
         if len(self.palm_history) < 4:
             return None
 
-        start_x = self.palm_history[0][0]
-        curr_x = self.palm_history[-1][0]
-        dx = curr_x - start_x
-
+        dx = self.palm_history[-1][0] - self.palm_history[0][0]
         if dx <= -self.SWEEP_MIN_DISTANCE:
             return "NEXT"
         elif dx >= self.SWEEP_MIN_DISTANCE:
@@ -142,12 +150,12 @@ class GestureEngine:
     def update(self, landmarks) -> tuple[str, bool]:
         now = time.time()
         pinch_y = (landmarks[4].y + landmarks[8].y) / 2.0
-        # Palm center approximation using wrist (0) and middle finger MCP (9)
-        raw_palm_x = (landmarks[0].x + landmarks[9].x) / 2.0
-        palm_x = self.palm_x_filter(raw_palm_x, now)
+        palm_x_raw = (landmarks[0].x + landmarks[9].x) / 2.0
+        palm_y_raw = (landmarks[0].y + landmarks[9].y) / 2.0
+        palm_x = self.palm_x_filter(palm_x_raw, now)
 
         if self.state == "COOLDOWN":
-            if now - self.last_action_time > 0.75:
+            if now - self.last_action_time > 0.85:
                 self.state = "ARMED"
                 self.last_active_time = now
                 self._reset_state_buffers()
@@ -214,15 +222,32 @@ class GestureEngine:
                 self._trigger_cooldown()
                 return "ACTION: Toggle Mute", False
 
-            # 4. Closed Fist (0.18s) -> Play / Pause
+            # 4. Fist Zones: Top-Left = Brave | Top-Right = Spotify | Elsewhere = Play/Pause
             if fist:
                 self.last_active_time = now
+                in_top_left = palm_x_raw < 0.28 and palm_y_raw < 0.35
+                in_top_right = palm_x_raw > 0.72 and palm_y_raw < 0.35
+
                 if self.fist_start == 0.0:
                     self.fist_start = now
-                elif now - self.fist_start >= 0.18:
-                    self.os_ctrl.play_pause()
-                    self._trigger_cooldown()
-                    return "ACTION: Play / Pause", False
+                elif now - self.fist_start >= 0.22:
+                    if in_top_left:
+                        self.os_ctrl.open_brave()
+                        self._trigger_cooldown()
+                        return "ACTION: Launch Brave (Top-Left Fist)", False
+                    elif in_top_right:
+                        self.os_ctrl.open_spotify()
+                        self._trigger_cooldown()
+                        return "ACTION: Launch Spotify (Top-Right Fist)", False
+                    else:
+                        self.os_ctrl.play_pause()
+                        self._trigger_cooldown()
+                        return "ACTION: Play / Pause", False
+
+                if in_top_left:
+                    return "HOLDING FIST TOP-LEFT (Brave)...", False
+                elif in_top_right:
+                    return "HOLDING FIST TOP-RIGHT (Spotify)...", False
                 return "HOLDING FIST (Play/Pause)...", False
             else:
                 self.fist_start = 0.0
@@ -233,7 +258,7 @@ class GestureEngine:
                 self.arm_start_time = 0.0
                 return "IDLE (Timed out)", False
 
-            return f"ARMED ({remaining:.1f}s) | Sweep R->L=Next | L->R=Prev | Pinch=Vol", False
+            return f"ARMED ({remaining:.1f}s) | TL/TR Fist=Brave/Spotify | Sweep=Track", False
 
         return "IDLE", False
 
@@ -294,6 +319,13 @@ def main():
                 t_pt = (int(lm[4].x * w), int(lm[4].y * h))
                 i_pt = (int(lm[8].x * w), int(lm[8].y * h))
                 cv2.line(frame, t_pt, i_pt, (0, 220, 255), 3)
+
+        # Draw subtle corner launch guides (Top-Left = Brave, Top-Right = Spotify)
+        cv2.rectangle(frame, (8, 52), (int(0.28 * w), int(0.35 * h)), (90, 140, 255), 1)
+        cv2.putText(frame, "BRAVE", (14, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (90, 140, 255), 1)
+
+        cv2.rectangle(frame, (int(0.72 * w), 52), (w - 55, int(0.35 * h)), (90, 220, 120), 1)
+        cv2.putText(frame, "SPOTIFY", (int(0.73 * w) + 4, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (90, 220, 120), 1)
 
         active_highlight = any(
             k in status for k in ("ARMED", "VOLUME", "ACTION", "COOLDOWN", "HOLDING")
