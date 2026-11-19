@@ -115,13 +115,13 @@ class GestureEngine:
             lm[20].y > lm[18].y,
         ])
 
-    def _is_peace_sign(self, lm):
-        # Index (8) & Middle (12) extended above PIP joints; Ring (16) & Pinky (20) curled down
+    def _is_three_fingers(self, lm):
+        # Index (8), Middle (12), Ring (16) extended; Pinky (20) curled down
         index_up = lm[8].y < lm[6].y
         middle_up = lm[12].y < lm[10].y
-        ring_down = lm[16].y > lm[14].y
+        ring_up = lm[16].y < lm[14].y
         pinky_down = lm[20].y > lm[18].y
-        return index_up and middle_up and ring_down and pinky_down
+        return index_up and middle_up and ring_up and pinky_down
 
     def _dist(self, lm, a: int, b: int) -> float:
         return math.hypot(lm[a].x - lm[b].x, lm[a].y - lm[b].y)
@@ -171,8 +171,8 @@ class GestureEngine:
             else:
                 self.pinch_anchor_y = None
 
-            # Peace Sign (V) -> Switch Window (e.g., Brave <-> Spotify)
-            if self._is_peace_sign(landmarks):
+            # Three Fingers (Index + Middle + Ring up, Pinky down) -> Switch Window
+            if self._is_three_fingers(landmarks):
                 self.os_ctrl.switch_window()
                 self._trigger_cooldown()
                 return "ACTION: Switch Window (Alt+Tab)", False
@@ -209,7 +209,7 @@ class GestureEngine:
                 self.state = "IDLE"
                 self.arm_start_time = 0.0
 
-        return "ARMED (V=Switch App | Pinch+Up/Down=Vol | Fist=Pause)", False
+        return "ARMED (3-Fingers=Switch App | Pinch+Up/Down=Vol | Fist=Pause)", False
 
     def _trigger_cooldown(self):
         self.state = "COOLDOWN"
