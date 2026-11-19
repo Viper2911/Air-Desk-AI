@@ -74,6 +74,10 @@ class FedoraController:
         except Exception:
             return 50, False
 
+    def switch_window(self):
+        # Linux evdev keycodes: 56 = KEY_LEFTALT, 15 = KEY_TAB
+        self.run_cmd(["ydotool", "key", "56:1", "15:1", "15:0", "56:0"])
+
     def next_tab(self):
         self.run_cmd(["ydotool", "key", "29:1", "15:1", "15:0", "29:0"])
 
@@ -111,6 +115,14 @@ class GestureEngine:
             lm[20].y > lm[18].y,
         ])
 
+    def _is_peace_sign(self, lm):
+        # Index (8) & Middle (12) extended above PIP joints; Ring (16) & Pinky (20) curled down
+        index_up = lm[8].y < lm[6].y
+        middle_up = lm[12].y < lm[10].y
+        ring_down = lm[16].y > lm[14].y
+        pinky_down = lm[20].y > lm[18].y
+        return index_up and middle_up and ring_down and pinky_down
+
     def _dist(self, lm, a: int, b: int) -> float:
         return math.hypot(lm[a].x - lm[b].x, lm[a].y - lm[b].y)
 
@@ -121,7 +133,7 @@ class GestureEngine:
         pinch_y = (landmarks[4].y + landmarks[8].y) / 2.0
 
         if self.state == "COOLDOWN":
-            if now - self.last_action_time > 0.70:
+            if now - self.last_action_time > 0.75:
                 self.state = "IDLE"
                 self.trajectory.clear()
             return "COOLDOWN", False
@@ -159,17 +171,26 @@ class GestureEngine:
             else:
                 self.pinch_anchor_y = None
 
+            # Peace Sign (V) -> Switch Window (e.g., Brave <-> Spotify)
+            if self._is_peace_sign(landmarks):
+                self.os_ctrl.switch_window()
+                self._trigger_cooldown()
+                return "ACTION: Switch Window (Alt+Tab)", False
+
+            # Middle-Finger Pinch -> Toggle Mute
             middle_pinched = self._dist(landmarks, 4, 12) < 0.042
             if middle_pinched and not index_pinched:
                 self.os_ctrl.toggle_mute()
                 self._trigger_cooldown()
                 return "ACTION: Toggle Mute", False
 
+            # Closed Fist -> Play / Pause
             if self._is_fist(landmarks):
                 self.os_ctrl.play_pause()
                 self._trigger_cooldown()
                 return "ACTION: Play / Pause", False
 
+            # Horizontal Flick -> Next / Previous Track
             self.trajectory.append((wrist_x, wrist_y, now))
             if len(self.trajectory) >= 8:
                 dx = self.trajectory[-1][0] - self.trajectory[0][0]
@@ -188,7 +209,7 @@ class GestureEngine:
                 self.state = "IDLE"
                 self.arm_start_time = 0.0
 
-        return "ARMED (Pinch+Up/Down=Vol | MidPinch=Mute | Fist=Pause)", False
+        return "ARMED (V=Switch App | Pinch+Up/Down=Vol | Fist=Pause)", False
 
     def _trigger_cooldown(self):
         self.state = "COOLDOWN"
