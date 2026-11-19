@@ -43,13 +43,13 @@ class FedoraController:
         subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def play_pause(self):
-        self.run_cmd(["playerctl", "play-pause"])
+        self.run_cmd(["playerctl", "--player=spotify,%any", "play-pause"])
 
     def next_track(self):
-        self.run_cmd(["playerctl", "next"])
+        self.run_cmd(["playerctl", "--player=spotify,%any", "next"])
 
     def prev_track(self):
-        self.run_cmd(["playerctl", "previous"])
+        self.run_cmd(["playerctl", "--player=spotify,%any", "previous"])
 
     def change_volume(self, delta_percent: int):
         if delta_percent == 0:
@@ -74,35 +74,28 @@ class FedoraController:
         except Exception:
             return 50, False
 
-    def switch_window(self):
-        # Linux evdev keycodes: 56 = KEY_LEFTALT, 15 = KEY_TAB
-        self.run_cmd(["ydotool", "key", "56:1", "15:1", "15:0", "56:0"])
-
-    def next_tab(self):
-        self.run_cmd(["ydotool", "key", "29:1", "15:1", "15:0", "29:0"])
-
-    def seek_youtube(self, forward=True):
-        code = "106" if forward else "105"
-        self.run_cmd(["ydotool", "key", f"{code}:1", f"{code}:0"])
-
 
 # --- 3. Gesture Classifier & Persistent Armed State Machine ---
 class GestureEngine:
-    ARMED_TIMEOUT = 10.0  # Stay armed for 10 seconds of inactivity
+    ARMED_TIMEOUT = 12.0
+    SWEEP_MIN_DISTANCE = 0.22  # ~22% of frame width for a deliberate palm sweep
+    SWEEP_MAX_WINDOW = 1.0     # Max seconds to complete the sweep
 
     def __init__(self):
-        self.state = "IDLE"  # IDLE -> ARMED -> COOLDOWN -> ARMED
+        self.state = "IDLE"
         self.arm_start_time = 0.0
-        self.three_finger_start = 0.0
+        self.fist_start = 0.0
         self.last_action_time = 0.0
         self.last_active_time = 0.0
         self.pinch_anchor_y = None
-        self.trajectory = deque(maxlen=12)
-        self.filter_x = OneEuroFilter(min_cutoff=1.2, beta=0.08)
-        self.filter_y = OneEuroFilter(min_cutoff=1.2, beta=0.08)
+        self.palm_history = deque(maxlen=25)
+        self.palm_x_filter = OneEuroFilter(min_cutoff=1.4, beta=0.12)
         self.os_ctrl = FedoraController()
 
-    def _is_open_palm(self, lm):
+    def _dist(self, lm, a: int, b: int) -> float:
+        return math.hypot(lm[a].x - lm[b].x, lm[a].y - lm[b].y)
+
+    def _is_open_palm(self, lm) -> bool:
         return all([
             lm[8].y < lm[6].y,
             lm[12].y < lm[10].y,
@@ -110,59 +103,78 @@ class GestureEngine:
             lm[20].y < lm[18].y,
         ])
 
-    def _is_fist(self, lm):
+    def _is_fist(self, lm) -> bool:
         return all([
-            lm[8].y > lm[6].y,
-            lm[12].y > lm[10].y,
-            lm[16].y > lm[14].y,
-            lm[20].y > lm[18].y,
+            lm[8].y > lm[6].y + 0.02,
+            lm[12].y > lm[10].y + 0.02,
+            lm[16].y > lm[14].y + 0.02,
+            lm[20].y > lm[18].y + 0.02,
         ])
 
-    def _is_three_fingers(self, lm):
-        # Index (8), Middle (12), Ring (16) clearly up; Pinky (20) folded well below ring tip
-        index_up = lm[8].y < lm[6].y
-        middle_up = lm[12].y < lm[10].y
-        ring_up = lm[16].y < lm[14].y
-        pinky_folded = lm[20].y > lm[19].y or (lm[20].y - lm[16].y) > 0.06
-        return index_up and middle_up and ring_up and pinky_folded
+    def _check_palm_sweep(self, now: float) -> str | None:
+        """
+        Returns 'NEXT' for right-to-left palm sweep (dx <= -SWEEP_MIN_DISTANCE),
+        'PREV' for left-to-right palm sweep (dx >= +SWEEP_MIN_DISTANCE),
+        or None if not swept far enough yet.
+        """
+        while len(self.palm_history) > 1 and (now - self.palm_history[0][1] > self.SWEEP_MAX_WINDOW):
+            self.palm_history.popleft()
 
-    def _dist(self, lm, a: int, b: int) -> float:
-        return math.hypot(lm[a].x - lm[b].x, lm[a].y - lm[b].y)
+        if len(self.palm_history) < 4:
+            return None
+
+        start_x = self.palm_history[0][0]
+        curr_x = self.palm_history[-1][0]
+        dx = curr_x - start_x
+
+        if dx <= -self.SWEEP_MIN_DISTANCE:
+            return "NEXT"
+        elif dx >= self.SWEEP_MIN_DISTANCE:
+            return "PREV"
+        return None
+
+    def _reset_state_buffers(self, keep_pinch=False):
+        self.fist_start = 0.0
+        self.palm_history.clear()
+        if not keep_pinch:
+            self.pinch_anchor_y = None
 
     def update(self, landmarks) -> tuple[str, bool]:
         now = time.time()
-        wrist_x = self.filter_x(landmarks[0].x, now)
-        wrist_y = self.filter_y(landmarks[0].y, now)
         pinch_y = (landmarks[4].y + landmarks[8].y) / 2.0
+        # Palm center approximation using wrist (0) and middle finger MCP (9)
+        raw_palm_x = (landmarks[0].x + landmarks[9].x) / 2.0
+        palm_x = self.palm_x_filter(raw_palm_x, now)
 
-        # Brief debounce after an action, then return directly to ARMED
         if self.state == "COOLDOWN":
             if now - self.last_action_time > 0.75:
                 self.state = "ARMED"
                 self.last_active_time = now
-                self.trajectory.clear()
+                self._reset_state_buffers()
             return "COOLDOWN (Staying Armed...)", False
 
         if self.state == "IDLE":
-            self.pinch_anchor_y = None
-            self.three_finger_start = 0.0
+            self._reset_state_buffers()
             if self._is_open_palm(landmarks):
                 if self.arm_start_time == 0.0:
                     self.arm_start_time = now
-                elif now - self.arm_start_time >= 0.35:
+                elif now - self.arm_start_time >= 0.30:
                     self.state = "ARMED"
                     self.last_active_time = now
-                    self.trajectory.clear()
             else:
                 self.arm_start_time = 0.0
-            return "IDLE (Hold open palm 0.35s to arm)", False
+            return "IDLE (Hold open palm 0.3s to arm)", False
 
         if self.state == "ARMED":
-            # 1. Continuous Pinch + Drag Volume Slider
             index_pinched = self._dist(landmarks, 4, 8) < 0.045
+            middle_pinched = self._dist(landmarks, 4, 12) < 0.042
+            open_palm = self._is_open_palm(landmarks)
+            fist = self._is_fist(landmarks)
+
+            # 1. Continuous Pinch + Drag Volume Slider
             if index_pinched:
                 self.last_active_time = now
-                self.three_finger_start = 0.0
+                self._reset_state_buffers(keep_pinch=True)
                 if self.pinch_anchor_y is None:
                     self.pinch_anchor_y = pinch_y
                     return "VOLUME SLIDER: Move hand Up / Down", True
@@ -179,55 +191,49 @@ class GestureEngine:
             else:
                 self.pinch_anchor_y = None
 
-            # 2. Three Fingers (hold 0.15s) -> Switch Window (Brave <-> Spotify)
-            if self._is_three_fingers(landmarks):
-                self.last_active_time = now
-                if self.three_finger_start == 0.0:
-                    self.three_finger_start = now
-                elif now - self.three_finger_start >= 0.15:
-                    self.os_ctrl.switch_window()
+            # 2. Open Palm Sweep (Right->Left = Next Track | Left->Right = Prev Track)
+            if open_palm and not middle_pinched:
+                self.palm_history.append((palm_x, now))
+                sweep_dir = self._check_palm_sweep(now)
+                if sweep_dir == "NEXT":
+                    self.os_ctrl.next_track()
                     self._trigger_cooldown()
-                    return "ACTION: Switch Window (Alt+Tab)", False
-                return "HOLDING 3-FINGERS...", False
+                    return "ACTION: Next Track (Palm Sweep R->L)", False
+                elif sweep_dir == "PREV":
+                    self.os_ctrl.prev_track()
+                    self._trigger_cooldown()
+                    return "ACTION: Previous Track (Palm Sweep L->R)", False
+                if len(self.palm_history) >= 2:
+                    self.last_active_time = now
             else:
-                self.three_finger_start = 0.0
+                self.palm_history.clear()
 
             # 3. Middle-Finger Pinch -> Toggle Mute
-            middle_pinched = self._dist(landmarks, 4, 12) < 0.042
-            if middle_pinched and not index_pinched:
+            if middle_pinched:
                 self.os_ctrl.toggle_mute()
                 self._trigger_cooldown()
                 return "ACTION: Toggle Mute", False
 
-            # 4. Closed Fist -> Play / Pause
-            if self._is_fist(landmarks):
-                self.os_ctrl.play_pause()
-                self._trigger_cooldown()
-                return "ACTION: Play / Pause", False
-
-            # 5. Horizontal Flick -> Next / Previous Track
-            self.trajectory.append((wrist_x, wrist_y, now))
-            if len(self.trajectory) >= 8:
-                dx = self.trajectory[-1][0] - self.trajectory[0][0]
-                dt = max(self.trajectory[-1][2] - self.trajectory[0][2], 1e-3)
-                velocity_x = dx / dt
-                if velocity_x < -1.1:
-                    self.os_ctrl.next_track()
+            # 4. Closed Fist (0.18s) -> Play / Pause
+            if fist:
+                self.last_active_time = now
+                if self.fist_start == 0.0:
+                    self.fist_start = now
+                elif now - self.fist_start >= 0.18:
+                    self.os_ctrl.play_pause()
                     self._trigger_cooldown()
-                    return "ACTION: Next Track", False
-                elif velocity_x > 1.1:
-                    self.os_ctrl.prev_track()
-                    self._trigger_cooldown()
-                    return "ACTION: Previous Track", False
+                    return "ACTION: Play / Pause", False
+                return "HOLDING FIST (Play/Pause)...", False
+            else:
+                self.fist_start = 0.0
 
-            # Auto-disarm only after ARMED_TIMEOUT seconds of no gestures
             remaining = self.ARMED_TIMEOUT - (now - self.last_active_time)
             if remaining <= 0:
                 self.state = "IDLE"
                 self.arm_start_time = 0.0
                 return "IDLE (Timed out)", False
 
-            return f"ARMED ({remaining:.1f}s) | 3-Fingers=Switch | Pinch=Vol", False
+            return f"ARMED ({remaining:.1f}s) | Sweep R->L=Next | L->R=Prev | Pinch=Vol", False
 
         return "IDLE", False
 
@@ -235,8 +241,7 @@ class GestureEngine:
         self.state = "COOLDOWN"
         self.last_action_time = time.time()
         self.last_active_time = time.time()
-        self.three_finger_start = 0.0
-        self.pinch_anchor_y = None
+        self._reset_state_buffers()
 
 
 # --- 4. Main Webcam Loop with Live Volume HUD ---
@@ -290,8 +295,11 @@ def main():
                 i_pt = (int(lm[8].x * w), int(lm[8].y * h))
                 cv2.line(frame, t_pt, i_pt, (0, 220, 255), 3)
 
-        color = (0, 255, 0) if ("ARMED" in status or "VOLUME" in status or "ACTION" in status or "HOLDING" in status) else (200, 200, 200)
-        cv2.putText(frame, status, (15, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.56, color, 2)
+        active_highlight = any(
+            k in status for k in ("ARMED", "VOLUME", "ACTION", "COOLDOWN", "HOLDING")
+        )
+        color = (0, 255, 0) if active_highlight else (200, 200, 200)
+        cv2.putText(frame, status, (15, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.52, color, 2)
 
         bar_x, bar_top, bar_bottom, bar_w = w - 45, 70, h - 50, 20
         bar_h = bar_bottom - bar_top
