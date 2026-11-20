@@ -1,4 +1,5 @@
 import math
+import os
 import shutil
 import subprocess
 import time
@@ -43,6 +44,11 @@ class FedoraController:
         self.has_ydotool = shutil.which("ydotool") is not None
         self.has_brightnessctl = shutil.which("brightnessctl") is not None
         self.has_playerctl = shutil.which("playerctl") is not None
+        self.ydotool_socket = (
+            "/run/user/1000/.ydotool_socket"
+            if os.path.exists("/run/user/1000/.ydotool_socket")
+            else "/tmp/.ydotool_socket"
+        )
 
     @staticmethod
     def run_cmd(cmd: list[str]):
@@ -85,9 +91,6 @@ class FedoraController:
             "@DEFAULT_AUDIO_SINK@", f"{abs(delta_percent)}%{sign}"
         ])
 
-    def toggle_mute(self):
-        self.run_cmd(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"])
-
     def change_brightness(self, delta_percent: int):
         if not self.has_brightnessctl or delta_percent == 0:
             return
@@ -106,15 +109,20 @@ class FedoraController:
         except Exception:
             return None
 
-    def minimize_active_window(self):
-        # GNOME Wayland minimize shortcut: Super + H (125 = KEY_LEFTMETA, 35 = KEY_H)
-        if self.has_ydotool:
-            self.run_cmd(["ydotool", "key", "--key-delay", "50", "125:1", "35:1", "35:0", "125:0"])
-
-    def close_active_window(self):
-        # Close active window: Alt + F4 (56 = KEY_LEFTALT, 62 = KEY_F4)
-        if self.has_ydotool:
-            self.run_cmd(["ydotool", "key", "--key-delay", "50", "56:1", "62:1", "62:0", "56:0"])
+    def next_tab(self) -> bool:
+        # Ctrl + Tab via ydotool (29 = KEY_LEFTCTRL, 15 = KEY_TAB)
+        if not self.has_ydotool:
+            return False
+        env = os.environ.copy()
+        env["YDOTOOL_SOCKET"] = self.ydotool_socket
+        res = subprocess.run(
+            ["ydotool", "key", "--key-delay", "100", "29:1", "15:1", "15:0", "29:0"],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=1.5,
+        )
+        return res.returncode == 0
 
     def get_volume_info(self) -> tuple[int, bool]:
         try:
@@ -128,7 +136,7 @@ class FedoraController:
             return 50, False
 
 
-# --- 3. Gesture Engine (Volume, Brightness Slider, Minimize & Close Window) ---
+# --- 3. Gesture Engine (Volume Slider, Index+Middle Brightness Slider & Tab Switcher) ---
 class GestureEngine:
     ARMED_TIMEOUT = 12.0
     SWEEP_MIN_DISTANCE = 0.22
@@ -138,8 +146,7 @@ class GestureEngine:
         self.state = "IDLE"
         self.arm_start_time = 0.0
         self.fist_start = 0.0
-        self.minimize_start = 0.0
-        self.close_start = 0.0
+        self.tab_switch_start = 0.0
         self.last_action_time = 0.0
         self.last_active_time = 0.0
         self.vol_anchor_y = None
@@ -170,23 +177,13 @@ class GestureEngine:
             lm[20].y > lm[18].y + 0.02,
         ])
 
-    def _is_index_and_pinky(self, lm) -> bool:
+    def _is_tab_switch_pose(self, lm) -> bool:
         return (
             lm[8].y < lm[6].y - 0.025
-            and lm[20].y < lm[18].y - 0.025
-            and lm[12].y > lm[10].y + 0.015
+            and lm[12].y < lm[10].y - 0.025
             and lm[16].y > lm[14].y + 0.015
+            and lm[20].y > lm[18].y + 0.015
         )
-
-    def _is_pinky_only(self, lm, scale: float) -> bool:
-        pinky_up = lm[20].y < lm[18].y - 0.025
-        others_curled = (
-            lm[8].y > lm[6].y + 0.015
-            and lm[12].y > lm[10].y + 0.015
-            and lm[16].y > lm[14].y + 0.015
-        )
-        thumb_tucked = self._dist(lm, 4, 5) < 0.72 * scale
-        return pinky_up and others_curled and thumb_tucked
 
     def _check_palm_sweep(self, now: float) -> str | None:
         while len(self.palm_history) > 1 and (now - self.palm_history[0][1] > self.SWEEP_MAX_WINDOW):
@@ -204,15 +201,13 @@ class GestureEngine:
 
     def _reset_state_buffers(self, keep_sliders=False):
         self.fist_start = 0.0
-        self.minimize_start = 0.0
-        self.close_start = 0.0
+        self.tab_switch_start = 0.0
         self.palm_history.clear()
         if not keep_sliders:
             self.vol_anchor_y = None
             self.bright_anchor_y = None
 
     def update(self, landmarks) -> tuple[str, str | None]:
-        """Returns (status_text, slider_mode) where slider_mode is 'VOL', 'BRIGHT', or None."""
         now = time.time()
         scale = self._hand_scale(landmarks)
         pinch_thresh = 0.28 * scale
@@ -222,7 +217,7 @@ class GestureEngine:
         palm_x = self.palm_x_filter(palm_x_raw, now)
 
         if self.state == "COOLDOWN":
-            if now - self.last_action_time > 0.85:
+            if now - self.last_action_time > 0.70:
                 self.state = "ARMED"
                 self.last_active_time = now
                 self._reset_state_buffers()
@@ -243,7 +238,6 @@ class GestureEngine:
         if self.state == "ARMED":
             index_pinched = self._dist(landmarks, 4, 8) < pinch_thresh
             middle_pinched = self._dist(landmarks, 4, 12) < pinch_thresh * 0.95
-            ring_pinched = self._dist(landmarks, 4, 16) < pinch_thresh * 0.95
             open_palm = self._is_open_palm(landmarks)
             fist = self._is_fist(landmarks)
 
@@ -267,12 +261,12 @@ class GestureEngine:
             else:
                 self.vol_anchor_y = None
 
-            # 2. Thumb + Ring Pinch & Vertical Drag -> Smart Screen Brightness Slider
-            if ring_pinched and not index_pinched and not middle_pinched:
+            # 2. Thumb + Middle Pinch & Vertical Drag -> Brightness Slider
+            if middle_pinched and not index_pinched:
                 self.last_active_time = now
                 self.vol_anchor_y = None
                 self._reset_state_buffers(keep_sliders=True)
-                b_y = (landmarks[4].y + landmarks[16].y) / 2.0
+                b_y = (landmarks[4].y + landmarks[12].y) / 2.0
                 if self.bright_anchor_y is None:
                     self.bright_anchor_y = b_y
                     return "BRIGHTNESS SLIDER: Move Up / Down", "BRIGHT"
@@ -287,42 +281,23 @@ class GestureEngine:
             else:
                 self.bright_anchor_y = None
 
-            # 3. Index + Pinky Hold (0.25s) -> Minimize Active Window
-            if not index_pinched and not middle_pinched and self._is_index_and_pinky(landmarks):
+            # 3. Index + Middle Hold (0.22s, not pinching thumb) -> Switch Tab (Ctrl+Tab)
+            if not index_pinched and not middle_pinched and self._is_tab_switch_pose(landmarks):
                 self.last_active_time = now
-                self.close_start = 0.0
-                if self.minimize_start == 0.0:
-                    self.minimize_start = now
-                elif now - self.minimize_start >= 0.25:
-                    self.os_ctrl.minimize_active_window()
+                if self.tab_switch_start == 0.0:
+                    self.tab_switch_start = now
+                elif now - self.tab_switch_start >= 0.22:
+                    ok = self.os_ctrl.next_tab()
                     self._trigger_cooldown()
-                    return "ACTION: Minimize Window", None
-                return "HOLD INDEX+PINKY (Minimize)...", None
+                    if ok:
+                        return "ACTION: Switch Tab (Ctrl+Tab)", None
+                    return "ERR: ydotool failed (check socket/perms)", None
+                return "HOLD INDEX+MID (Switch Tab)...", None
             else:
-                self.minimize_start = 0.0
+                self.tab_switch_start = 0.0
 
-            # 4. Pinky Only Hold (0.35s) -> Close Active Window
-            if not index_pinched and not middle_pinched and self._is_pinky_only(landmarks, scale):
-                self.last_active_time = now
-                self.minimize_start = 0.0
-                if self.close_start == 0.0:
-                    self.close_start = now
-                elif now - self.close_start >= 0.35:
-                    self.os_ctrl.close_active_window()
-                    self._trigger_cooldown()
-                    return "ACTION: Close Window (Alt+F4)", None
-                return "HOLD PINKY ONLY (Close Window)...", None
-            else:
-                self.close_start = 0.0
-
-            # 5. Middle-Finger Pinch -> Toggle Mute
-            if middle_pinched and not index_pinched:
-                self.os_ctrl.toggle_mute()
-                self._trigger_cooldown()
-                return "ACTION: Toggle Mute", None
-
-            # 6. Open Palm Sweep (R->L = Next Track | L->R = Prev Track)
-            if open_palm and not middle_pinched and not ring_pinched:
+            # 4. Open Palm Sweep (R->L = Next Track | L->R = Prev Track)
+            if open_palm and not middle_pinched:
                 self.palm_history.append((palm_x, now))
                 sweep_dir = self._check_palm_sweep(now)
                 if sweep_dir == "NEXT":
@@ -338,7 +313,7 @@ class GestureEngine:
             else:
                 self.palm_history.clear()
 
-            # 7. Fist Zones: Top-Left = Brave | Top-Right = Spotify | Elsewhere = Play/Pause
+            # 5. Fist Zones: Top-Left = Brave | Top-Right = Spotify | Elsewhere = Play/Pause
             if fist:
                 self.last_active_time = now
                 in_top_left = palm_x_raw < 0.28 and palm_y_raw < 0.35
@@ -374,7 +349,7 @@ class GestureEngine:
                 self.arm_start_time = 0.0
                 return "IDLE (Timed out)", None
 
-            return f"ARMED ({remaining:.1f}s) | Ring=Bright | Idx+Pinky=Min | Pinky=Close", None
+            return f"ARMED ({remaining:.1f}s) | Idx=Vol | Mid=Bright | Sweep=Track", None
 
         return "IDLE", None
 
@@ -439,8 +414,8 @@ def main():
                 cv2.line(frame, t_pt, i_pt, (0, 220, 255), 3)
             elif slider_mode == "BRIGHT":
                 t_pt = (int(lm[4].x * w), int(lm[4].y * h))
-                r_pt = (int(lm[16].x * w), int(lm[16].y * h))
-                cv2.line(frame, t_pt, r_pt, (255, 180, 50), 3)
+                m_pt = (int(lm[12].x * w), int(lm[12].y * h))
+                cv2.line(frame, t_pt, m_pt, (255, 180, 50), 3)
 
         # Corner launch guides (Top-Left = Brave, Top-Right = Spotify)
         cv2.rectangle(frame, (8, 52), (int(0.28 * w), int(0.35 * h)), (90, 140, 255), 1)
@@ -450,7 +425,7 @@ def main():
         cv2.putText(frame, "SPOTIFY", (int(0.73 * w) + 4, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (90, 220, 120), 1)
 
         active_highlight = any(
-            k in status for k in ("ARMED", "VOLUME", "BRIGHTNESS", "ACTION", "COOLDOWN", "HOLDING", "HOLD INDEX", "HOLD PINKY")
+            k in status for k in ("ARMED", "VOLUME", "BRIGHTNESS", "ACTION", "COOLDOWN", "HOLDING", "HOLD INDEX")
         )
         color = (0, 255, 0) if active_highlight else (200, 200, 200)
         cv2.putText(frame, status, (15, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.50, color, 2)
