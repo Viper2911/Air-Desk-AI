@@ -49,10 +49,19 @@ class FedoraController:
             if os.path.exists("/run/user/1000/.ydotool_socket")
             else "/tmp/.ydotool_socket"
         )
+        self.alt_held = False
 
     @staticmethod
-    def run_cmd(cmd: list[str]):
-        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    def run_cmd(cmd: list[str], extra_env: dict[str, str] | None = None):
+        env = os.environ.copy()
+        if extra_env:
+            env.update(extra_env)
+        subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
 
     def launch_app(self, candidates: list[str]):
         cmd_str = " || ".join(f"command -v {c} >/dev/null 2>&1 && exec {c}" for c in candidates)
@@ -109,20 +118,35 @@ class FedoraController:
         except Exception:
             return None
 
-    def next_tab(self) -> bool:
-        # Ctrl + Tab via ydotool (29 = KEY_LEFTCTRL, 15 = KEY_TAB)
+    def begin_window_switcher(self) -> bool:
+        # Hold Left Alt (56:1) and press Tab once (15:1 15:0) to open switcher
         if not self.has_ydotool:
             return False
-        env = os.environ.copy()
-        env["YDOTOOL_SOCKET"] = self.ydotool_socket
-        res = subprocess.run(
-            ["ydotool", "key", "--key-delay", "100", "29:1", "15:1", "15:0", "29:0"],
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=1.5,
+        self.alt_held = True
+        self.run_cmd(
+            ["ydotool", "key", "--key-delay", "40", "56:1", "15:1", "15:0"],
+            extra_env={"YDOTOOL_SOCKET": self.ydotool_socket},
         )
-        return res.returncode == 0
+        return True
+
+    def step_window_switcher(self) -> bool:
+        # Tap Tab (15:1 15:0) while Left Alt remains held
+        if not self.has_ydotool:
+            return False
+        self.run_cmd(
+            ["ydotool", "key", "--key-delay", "40", "15:1", "15:0"],
+            extra_env={"YDOTOOL_SOCKET": self.ydotool_socket},
+        )
+        return True
+
+    def commit_window_switcher(self):
+        # Release Left Alt (56:0) to focus the selected window
+        if self.has_ydotool and self.alt_held:
+            self.alt_held = False
+            self.run_cmd(
+                ["ydotool", "key", "--key-delay", "30", "56:0"],
+                extra_env={"YDOTOOL_SOCKET": self.ydotool_socket},
+            )
 
     def get_volume_info(self) -> tuple[int, bool]:
         try:
@@ -136,17 +160,20 @@ class FedoraController:
             return 50, False
 
 
-# --- 3. Gesture Engine (Volume Slider, Index+Middle Brightness Slider & Tab Switcher) ---
+# --- 3. Gesture Engine (Volume Slider, Brightness Slider & Multi-Window Switcher) ---
 class GestureEngine:
-    ARMED_TIMEOUT = 12.0
+    ARMED_TIMEOUT = 15.0
     SWEEP_MIN_DISTANCE = 0.22
     SWEEP_MAX_WINDOW = 1.0
+    WINDOW_STEP_INTERVAL = 0.55
 
     def __init__(self):
         self.state = "IDLE"
         self.arm_start_time = 0.0
         self.fist_start = 0.0
-        self.tab_switch_start = 0.0
+        self.win_pinch_active = False
+        self.win_last_step_time = 0.0
+        self.win_release_seen_time = 0.0
         self.last_action_time = 0.0
         self.last_active_time = 0.0
         self.vol_anchor_y = None
@@ -177,14 +204,6 @@ class GestureEngine:
             lm[20].y > lm[18].y + 0.02,
         ])
 
-    def _is_tab_switch_pose(self, lm) -> bool:
-        return (
-            lm[8].y < lm[6].y - 0.025
-            and lm[12].y < lm[10].y - 0.025
-            and lm[16].y > lm[14].y + 0.015
-            and lm[20].y > lm[18].y + 0.015
-        )
-
     def _check_palm_sweep(self, now: float) -> str | None:
         while len(self.palm_history) > 1 and (now - self.palm_history[0][1] > self.SWEEP_MAX_WINDOW):
             self.palm_history.popleft()
@@ -201,11 +220,17 @@ class GestureEngine:
 
     def _reset_state_buffers(self, keep_sliders=False):
         self.fist_start = 0.0
-        self.tab_switch_start = 0.0
         self.palm_history.clear()
         if not keep_sliders:
             self.vol_anchor_y = None
             self.bright_anchor_y = None
+
+    def _release_window_switcher_if_needed(self):
+        if self.win_pinch_active or self.os_ctrl.alt_held:
+            self.os_ctrl.commit_window_switcher()
+            self.win_pinch_active = False
+            self.win_last_step_time = 0.0
+            self.win_release_seen_time = 0.0
 
     def update(self, landmarks) -> tuple[str, str | None]:
         now = time.time()
@@ -217,13 +242,14 @@ class GestureEngine:
         palm_x = self.palm_x_filter(palm_x_raw, now)
 
         if self.state == "COOLDOWN":
-            if now - self.last_action_time > 0.70:
+            if now - self.last_action_time > 0.55:
                 self.state = "ARMED"
                 self.last_active_time = now
                 self._reset_state_buffers()
             return "COOLDOWN (Staying Armed...)", None
 
         if self.state == "IDLE":
+            self._release_window_switcher_if_needed()
             self._reset_state_buffers()
             if self._is_open_palm(landmarks):
                 if self.arm_start_time == 0.0:
@@ -238,10 +264,39 @@ class GestureEngine:
         if self.state == "ARMED":
             index_pinched = self._dist(landmarks, 4, 8) < pinch_thresh
             middle_pinched = self._dist(landmarks, 4, 12) < pinch_thresh * 0.95
+            ring_pinched = self._dist(landmarks, 4, 16) < pinch_thresh
             open_palm = self._is_open_palm(landmarks)
             fist = self._is_fist(landmarks)
 
-            # 1. Thumb + Index Pinch & Vertical Drag -> Volume Slider
+            # 1. Thumb + Ring Pinch -> Multi-Window Switcher (Hold Alt, step Tab every 0.55s, release Alt on unpinch)
+            if ring_pinched and not index_pinched and not middle_pinched:
+                self.last_active_time = now
+                self.win_release_seen_time = 0.0
+                if not self.win_pinch_active:
+                    self.win_pinch_active = True
+                    self.win_last_step_time = now
+                    ok = self.os_ctrl.begin_window_switcher()
+                    return (
+                        "WINDOW SWITCHER: Hold pinch to cycle, release to select"
+                        if ok else "ERR: ydotool missing"
+                    ), "WIN"
+                elif now - self.win_last_step_time >= self.WINDOW_STEP_INTERVAL:
+                    self.win_last_step_time = now
+                    self.os_ctrl.step_window_switcher()
+                    return "WINDOW SWITCHER: Next window... (release to focus)", "WIN"
+                return "WINDOW SWITCHER ACTIVE (release pinch to focus)", "WIN"
+            elif self.win_pinch_active:
+                if self.win_release_seen_time == 0.0:
+                    self.win_release_seen_time = now
+                elif now - self.win_release_seen_time >= 0.14:
+                    self._release_window_switcher_if_needed()
+                    self.state = "COOLDOWN"
+                    self.last_action_time = now
+                    self.last_active_time = now
+                    return "ACTION: Focused Selected Window", None
+                return "WINDOW SWITCHER: Release to focus...", "WIN"
+
+            # 2. Thumb + Index Pinch & Vertical Drag -> Volume Slider
             if index_pinched:
                 self.last_active_time = now
                 self.bright_anchor_y = None
@@ -261,7 +316,7 @@ class GestureEngine:
             else:
                 self.vol_anchor_y = None
 
-            # 2. Thumb + Middle Pinch & Vertical Drag -> Brightness Slider
+            # 3. Thumb + Middle Pinch & Vertical Drag -> Brightness Slider
             if middle_pinched and not index_pinched:
                 self.last_active_time = now
                 self.vol_anchor_y = None
@@ -280,21 +335,6 @@ class GestureEngine:
                 return "BRIGHTNESS SLIDER ACTIVE", "BRIGHT"
             else:
                 self.bright_anchor_y = None
-
-            # 3. Index + Middle Hold (0.22s, not pinching thumb) -> Switch Tab (Ctrl+Tab)
-            if not index_pinched and not middle_pinched and self._is_tab_switch_pose(landmarks):
-                self.last_active_time = now
-                if self.tab_switch_start == 0.0:
-                    self.tab_switch_start = now
-                elif now - self.tab_switch_start >= 0.22:
-                    ok = self.os_ctrl.next_tab()
-                    self._trigger_cooldown()
-                    if ok:
-                        return "ACTION: Switch Tab (Ctrl+Tab)", None
-                    return "ERR: ydotool failed (check socket/perms)", None
-                return "HOLD INDEX+MID (Switch Tab)...", None
-            else:
-                self.tab_switch_start = 0.0
 
             # 4. Open Palm Sweep (R->L = Next Track | L->R = Prev Track)
             if open_palm and not middle_pinched:
@@ -349,7 +389,7 @@ class GestureEngine:
                 self.arm_start_time = 0.0
                 return "IDLE (Timed out)", None
 
-            return f"ARMED ({remaining:.1f}s) | Idx=Vol | Mid=Bright | Sweep=Track", None
+            return f"ARMED ({remaining:.1f}s) | Thumb+Ring=Win | Mid=Bright | Idx=Vol", None
 
         return "IDLE", None
 
@@ -360,7 +400,7 @@ class GestureEngine:
         self._reset_state_buffers()
 
 
-# --- 4. Main Webcam Loop with Live Volume & Brightness HUD ---
+# --- 4. Main Webcam Loop with Persistent Topmost HUD ---
 def main():
     base_options = python.BaseOptions(model_asset_path="models/hand_landmarker.task")
     options = vision.HandLandmarkerOptions(
@@ -377,83 +417,103 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
+    win_name = "Air-Desk Fedora HUD"
+    cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(win_name, 640, 480)
+    try:
+        cv2.setWindowProperty(win_name, cv2.WND_PROP_TOPMOST, 1)
+    except Exception:
+        pass
+
     vol_pct, is_muted = engine.os_ctrl.get_volume_info()
     bright_pct = engine.os_ctrl.get_brightness_info()
     last_sys_poll = 0.0
 
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
+    try:
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                time.sleep(0.02)
+                key = cv2.waitKey(1) & 0xFF
+                if key == 27:
+                    break
+                continue
 
-        now = time.time()
-        if now - last_sys_poll > 0.20:
-            vol_pct, is_muted = engine.os_ctrl.get_volume_info()
-            bright_pct = engine.os_ctrl.get_brightness_info()
-            last_sys_poll = now
+            now = time.time()
+            if now - last_sys_poll > 0.20:
+                vol_pct, is_muted = engine.os_ctrl.get_volume_info()
+                bright_pct = engine.os_ctrl.get_brightness_info()
+                last_sys_poll = now
 
-        frame = cv2.flip(frame, 1)
-        h, w, _ = frame.shape
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            frame = cv2.flip(frame, 1)
+            h, w, _ = frame.shape
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-        result = detector.detect_for_video(mp_image, int(now * 1000))
-        status = "No Hand Detected"
-        slider_mode = None
+            result = detector.detect_for_video(mp_image, int(now * 1000))
+            status = "No Hand Detected"
+            slider_mode = None
 
-        if result.hand_landmarks:
-            lm = result.hand_landmarks[0]
-            status, slider_mode = engine.update(lm)
-            for pt in lm:
-                cx, cy = int(pt.x * w), int(pt.y * h)
-                cv2.circle(frame, (cx, cy), 3, (0, 255, 180), -1)
+            if result.hand_landmarks:
+                lm = result.hand_landmarks[0]
+                status, slider_mode = engine.update(lm)
+                for pt in lm:
+                    cx, cy = int(pt.x * w), int(pt.y * h)
+                    cv2.circle(frame, (cx, cy), 3, (0, 255, 180), -1)
 
-            if slider_mode == "VOL":
-                t_pt = (int(lm[4].x * w), int(lm[4].y * h))
-                i_pt = (int(lm[8].x * w), int(lm[8].y * h))
-                cv2.line(frame, t_pt, i_pt, (0, 220, 255), 3)
-            elif slider_mode == "BRIGHT":
-                t_pt = (int(lm[4].x * w), int(lm[4].y * h))
-                m_pt = (int(lm[12].x * w), int(lm[12].y * h))
-                cv2.line(frame, t_pt, m_pt, (255, 180, 50), 3)
+                if slider_mode == "VOL":
+                    t_pt = (int(lm[4].x * w), int(lm[4].y * h))
+                    i_pt = (int(lm[8].x * w), int(lm[8].y * h))
+                    cv2.line(frame, t_pt, i_pt, (0, 220, 255), 3)
+                elif slider_mode == "BRIGHT":
+                    t_pt = (int(lm[4].x * w), int(lm[4].y * h))
+                    m_pt = (int(lm[12].x * w), int(lm[12].y * h))
+                    cv2.line(frame, t_pt, m_pt, (255, 180, 50), 3)
+                elif slider_mode == "WIN":
+                    t_pt = (int(lm[4].x * w), int(lm[4].y * h))
+                    rg_pt = (int(lm[16].x * w), int(lm[16].y * h))
+                    cv2.line(frame, t_pt, rg_pt, (220, 120, 255), 3)
+            else:
+                engine._release_window_switcher_if_needed()
 
-        # Corner launch guides (Top-Left = Brave, Top-Right = Spotify)
-        cv2.rectangle(frame, (8, 52), (int(0.28 * w), int(0.35 * h)), (90, 140, 255), 1)
-        cv2.putText(frame, "BRAVE", (14, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (90, 140, 255), 1)
+            # Corner launch guides (Top-Left = Brave, Top-Right = Spotify)
+            cv2.rectangle(frame, (8, 52), (int(0.28 * w), int(0.35 * h)), (90, 140, 255), 1)
+            cv2.putText(frame, "BRAVE", (14, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (90, 140, 255), 1)
 
-        cv2.rectangle(frame, (int(0.72 * w), 52), (w - 68, int(0.35 * h)), (90, 220, 120), 1)
-        cv2.putText(frame, "SPOTIFY", (int(0.73 * w) + 4, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (90, 220, 120), 1)
+            cv2.rectangle(frame, (int(0.72 * w), 52), (w - 68, int(0.35 * h)), (90, 220, 120), 1)
+            cv2.putText(frame, "SPOTIFY", (int(0.73 * w) + 4, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (90, 220, 120), 1)
 
-        active_highlight = any(
-            k in status for k in ("ARMED", "VOLUME", "BRIGHTNESS", "ACTION", "COOLDOWN", "HOLDING", "HOLD INDEX")
-        )
-        color = (0, 255, 0) if active_highlight else (200, 200, 200)
-        cv2.putText(frame, status, (15, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.50, color, 2)
+            active_highlight = any(
+                k in status for k in ("ARMED", "VOLUME", "BRIGHTNESS", "ACTION", "COOLDOWN", "HOLDING", "WINDOW")
+            )
+            color = (0, 255, 0) if active_highlight else (200, 200, 200)
+            cv2.putText(frame, status, (15, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.50, color, 2)
 
-        # Right-side Volume Bar
-        bar_x, bar_top, bar_bottom, bar_w = w - 42, 70, h - 50, 18
-        bar_h = bar_bottom - bar_top
-        cv2.rectangle(frame, (bar_x, bar_top), (bar_x + bar_w, bar_bottom), (80, 80, 80), 2)
-        fill_h = int(bar_h * (0 if is_muted else min(vol_pct, 100) / 100.0))
-        fill_color = (0, 100, 255) if is_muted else (0, 230, 180)
-        cv2.rectangle(frame, (bar_x + 2, bar_bottom - fill_h), (bar_x + bar_w - 2, bar_bottom - 2), fill_color, -1)
-        vol_label = "MUTE" if is_muted else f"{vol_pct}%"
-        cv2.putText(frame, vol_label, (bar_x - 14, bar_bottom + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.48, fill_color, 2)
+            # Right-side Volume Bar
+            bar_x, bar_top, bar_bottom, bar_w = w - 42, 70, h - 50, 18
+            bar_h = bar_bottom - bar_top
+            cv2.rectangle(frame, (bar_x, bar_top), (bar_x + bar_w, bar_bottom), (80, 80, 80), 2)
+            fill_h = int(bar_h * (0 if is_muted else min(vol_pct, 100) / 100.0))
+            fill_color = (0, 100, 255) if is_muted else (0, 230, 180)
+            cv2.rectangle(frame, (bar_x + 2, bar_bottom - fill_h), (bar_x + bar_w - 2, bar_bottom - 2), fill_color, -1)
+            vol_label = "MUTE" if is_muted else f"{vol_pct}%"
+            cv2.putText(frame, vol_label, (bar_x - 14, bar_bottom + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.48, fill_color, 2)
 
-        # Brightness Bar (when brightnessctl is available on laptop)
-        if bright_pct is not None:
-            b_x = w - 68
-            cv2.rectangle(frame, (b_x, bar_top), (b_x + bar_w, bar_bottom), (80, 80, 80), 2)
-            b_fill_h = int(bar_h * (min(bright_pct, 100) / 100.0))
-            cv2.rectangle(frame, (b_x + 2, bar_bottom - b_fill_h), (b_x + bar_w - 2, bar_bottom - 2), (255, 180, 50), -1)
-            cv2.putText(frame, f"{bright_pct}%", (b_x - 10, bar_bottom + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 180, 50), 2)
+            # Brightness Bar (when brightnessctl is available on laptop)
+            if bright_pct is not None:
+                b_x = w - 68
+                cv2.rectangle(frame, (b_x, bar_top), (b_x + bar_w, bar_bottom), (80, 80, 80), 2)
+                b_fill_h = int(bar_h * (min(bright_pct, 100) / 100.0))
+                cv2.rectangle(frame, (b_x + 2, bar_bottom - b_fill_h), (b_x + bar_w - 2, bar_bottom - 2), (255, 180, 50), -1)
+                cv2.putText(frame, f"{bright_pct}%", (b_x - 10, bar_bottom + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 180, 50), 2)
 
-        cv2.imshow("Air-Desk Fedora HUD", frame)
-        if cv2.waitKey(1) & 0xFF == 27:
-            break
-
-    cap.release()
-    cv2.destroyAllWindows()
+            cv2.imshow(win_name, frame)
+            if cv2.waitKey(1) & 0xFF == 27:
+                break
+    finally:
+        engine._release_window_switcher_if_needed()
+        cap.release()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
