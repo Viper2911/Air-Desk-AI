@@ -119,7 +119,6 @@ class FedoraController:
             return None
 
     def begin_window_switcher(self) -> bool:
-        # Hold Left Alt (56:1) and press Tab once (15:1 15:0) to open switcher
         if not self.has_ydotool:
             return False
         self.alt_held = True
@@ -130,7 +129,6 @@ class FedoraController:
         return True
 
     def step_window_switcher(self) -> bool:
-        # Tap Tab (15:1 15:0) while Left Alt remains held
         if not self.has_ydotool:
             return False
         self.run_cmd(
@@ -140,7 +138,6 @@ class FedoraController:
         return True
 
     def commit_window_switcher(self):
-        # Release Left Alt (56:0) to focus the selected window
         if self.has_ydotool and self.alt_held:
             self.alt_held = False
             self.run_cmd(
@@ -160,17 +157,20 @@ class FedoraController:
             return 50, False
 
 
-# --- 3. Gesture Engine (Volume Slider, Brightness Slider & Multi-Window Switcher) ---
+# --- 3. Gesture Engine (Volume, Brightness, Window Switcher & Thumb+Pinky 1s Quit) ---
 class GestureEngine:
     ARMED_TIMEOUT = 15.0
     SWEEP_MIN_DISTANCE = 0.22
     SWEEP_MAX_WINDOW = 1.0
     WINDOW_STEP_INTERVAL = 0.55
+    QUIT_HOLD_DURATION = 1.0
 
     def __init__(self):
         self.state = "IDLE"
         self.arm_start_time = 0.0
         self.fist_start = 0.0
+        self.quit_start = 0.0
+        self.quit_last_seen = 0.0
         self.win_pinch_active = False
         self.win_last_step_time = 0.0
         self.win_release_seen_time = 0.0
@@ -220,6 +220,8 @@ class GestureEngine:
 
     def _reset_state_buffers(self, keep_sliders=False):
         self.fist_start = 0.0
+        self.quit_start = 0.0
+        self.quit_last_seen = 0.0
         self.palm_history.clear()
         if not keep_sliders:
             self.vol_anchor_y = None
@@ -232,25 +234,51 @@ class GestureEngine:
             self.win_last_step_time = 0.0
             self.win_release_seen_time = 0.0
 
-    def update(self, landmarks) -> tuple[str, str | None]:
+    def _check_quit_pinch(self, pinky_pinched: bool, now: float) -> tuple[bool, str | None, str | None]:
+        if pinky_pinched:
+            self.quit_last_seen = now
+            if self.quit_start == 0.0:
+                self.quit_start = now
+            elapsed = now - self.quit_start
+            if elapsed >= self.QUIT_HOLD_DURATION:
+                return True, "ACTION: Closing Air-Desk AI...", "QUIT"
+            rem = max(0.0, self.QUIT_HOLD_DURATION - elapsed)
+            return False, f"HOLD THUMB+PINKY ({rem:.1f}s) -> Quit", "QUIT"
+        if self.quit_start != 0.0 and (now - self.quit_last_seen > 0.10):
+            self.quit_start = 0.0
+            self.quit_last_seen = 0.0
+        return False, None, None
+
+    def update(self, landmarks) -> tuple[str, str | None, bool]:
+        """Returns (status_text, slider_mode, should_quit)."""
         now = time.time()
         scale = self._hand_scale(landmarks)
         pinch_thresh = 0.28 * scale
+        pinky_pinch_thresh = 0.34 * scale
 
         palm_x_raw = (landmarks[0].x + landmarks[9].x) / 2.0
         palm_y_raw = (landmarks[0].y + landmarks[9].y) / 2.0
         palm_x = self.palm_x_filter(palm_x_raw, now)
+
+        index_pinched = self._dist(landmarks, 4, 8) < pinch_thresh
+        middle_pinched = self._dist(landmarks, 4, 12) < pinch_thresh * 0.95
+        ring_pinched = self._dist(landmarks, 4, 16) < pinch_thresh
+        pinky_pinched = self._dist(landmarks, 4, 20) < pinky_pinch_thresh
 
         if self.state == "COOLDOWN":
             if now - self.last_action_time > 0.55:
                 self.state = "ARMED"
                 self.last_active_time = now
                 self._reset_state_buffers()
-            return "COOLDOWN (Staying Armed...)", None
+            return "COOLDOWN (Staying Armed...)", None, False
 
         if self.state == "IDLE":
             self._release_window_switcher_if_needed()
             self._reset_state_buffers()
+            should_quit, quit_msg, mode = self._check_quit_pinch(pinky_pinched, now)
+            if should_quit or quit_msg:
+                return quit_msg or "CLOSING...", mode, should_quit
+
             if self._is_open_palm(landmarks):
                 if self.arm_start_time == 0.0:
                     self.arm_start_time = now
@@ -259,17 +287,23 @@ class GestureEngine:
                     self.last_active_time = now
             else:
                 self.arm_start_time = 0.0
-            return "IDLE (Hold open palm 0.3s to arm)", None
+            return "IDLE (Open palm 0.3s=Arm | Thumb+Pinky 1s=Quit)", None, False
 
         if self.state == "ARMED":
-            index_pinched = self._dist(landmarks, 4, 8) < pinch_thresh
-            middle_pinched = self._dist(landmarks, 4, 12) < pinch_thresh * 0.95
-            ring_pinched = self._dist(landmarks, 4, 16) < pinch_thresh
             open_palm = self._is_open_palm(landmarks)
             fist = self._is_fist(landmarks)
 
+            # Thumb + Pinky pinch held for 1.0s -> Quit Air-Desk AI
+            if pinky_pinched and not index_pinched and not middle_pinched and not ring_pinched:
+                self.last_active_time = now
+                should_quit, quit_msg, mode = self._check_quit_pinch(True, now)
+                if should_quit or quit_msg:
+                    return quit_msg or "CLOSING...", mode, should_quit
+            else:
+                _, _, _ = self._check_quit_pinch(False, now)
+
             # 1. Thumb + Ring Pinch -> Multi-Window Switcher (Hold Alt, step Tab every 0.55s, release Alt on unpinch)
-            if ring_pinched and not index_pinched and not middle_pinched:
+            if ring_pinched and not index_pinched and not middle_pinched and not pinky_pinched:
                 self.last_active_time = now
                 self.win_release_seen_time = 0.0
                 if not self.win_pinch_active:
@@ -279,12 +313,12 @@ class GestureEngine:
                     return (
                         "WINDOW SWITCHER: Hold pinch to cycle, release to select"
                         if ok else "ERR: ydotool missing"
-                    ), "WIN"
+                    ), "WIN", False
                 elif now - self.win_last_step_time >= self.WINDOW_STEP_INTERVAL:
                     self.win_last_step_time = now
                     self.os_ctrl.step_window_switcher()
-                    return "WINDOW SWITCHER: Next window... (release to focus)", "WIN"
-                return "WINDOW SWITCHER ACTIVE (release pinch to focus)", "WIN"
+                    return "WINDOW SWITCHER: Next window... (release to focus)", "WIN", False
+                return "WINDOW SWITCHER ACTIVE (release pinch to focus)", "WIN", False
             elif self.win_pinch_active:
                 if self.win_release_seen_time == 0.0:
                     self.win_release_seen_time = now
@@ -293,61 +327,61 @@ class GestureEngine:
                     self.state = "COOLDOWN"
                     self.last_action_time = now
                     self.last_active_time = now
-                    return "ACTION: Focused Selected Window", None
-                return "WINDOW SWITCHER: Release to focus...", "WIN"
+                    return "ACTION: Focused Selected Window", None, False
+                return "WINDOW SWITCHER: Release to focus...", "WIN", False
 
             # 2. Thumb + Index Pinch & Vertical Drag -> Volume Slider
-            if index_pinched:
+            if index_pinched and not pinky_pinched:
                 self.last_active_time = now
                 self.bright_anchor_y = None
                 self._reset_state_buffers(keep_sliders=True)
                 pinch_y = (landmarks[4].y + landmarks[8].y) / 2.0
                 if self.vol_anchor_y is None:
                     self.vol_anchor_y = pinch_y
-                    return "VOLUME SLIDER: Move Up / Down", "VOL"
+                    return "VOLUME SLIDER: Move Up / Down", "VOL", False
 
                 dy = self.vol_anchor_y - pinch_y
                 if abs(dy) >= 0.015:
                     step = max(-10, min(10, int(round(dy * 220))))
                     self.os_ctrl.change_volume(step)
                     self.vol_anchor_y = pinch_y
-                    return f"VOLUME: {'+' if step > 0 else ''}{step}%", "VOL"
-                return "VOLUME SLIDER ACTIVE", "VOL"
+                    return f"VOLUME: {'+' if step > 0 else ''}{step}%", "VOL", False
+                return "VOLUME SLIDER ACTIVE", "VOL", False
             else:
                 self.vol_anchor_y = None
 
             # 3. Thumb + Middle Pinch & Vertical Drag -> Brightness Slider
-            if middle_pinched and not index_pinched:
+            if middle_pinched and not index_pinched and not pinky_pinched:
                 self.last_active_time = now
                 self.vol_anchor_y = None
                 self._reset_state_buffers(keep_sliders=True)
                 b_y = (landmarks[4].y + landmarks[12].y) / 2.0
                 if self.bright_anchor_y is None:
                     self.bright_anchor_y = b_y
-                    return "BRIGHTNESS SLIDER: Move Up / Down", "BRIGHT"
+                    return "BRIGHTNESS SLIDER: Move Up / Down", "BRIGHT", False
 
                 dy = self.bright_anchor_y - b_y
                 if abs(dy) >= 0.018:
                     step = max(-10, min(10, int(round(dy * 200))))
                     self.os_ctrl.change_brightness(step)
                     self.bright_anchor_y = b_y
-                    return f"BRIGHTNESS: {'+' if step > 0 else ''}{step}%", "BRIGHT"
-                return "BRIGHTNESS SLIDER ACTIVE", "BRIGHT"
+                    return f"BRIGHTNESS: {'+' if step > 0 else ''}{step}%", "BRIGHT", False
+                return "BRIGHTNESS SLIDER ACTIVE", "BRIGHT", False
             else:
                 self.bright_anchor_y = None
 
             # 4. Open Palm Sweep (R->L = Next Track | L->R = Prev Track)
-            if open_palm and not middle_pinched:
+            if open_palm and not middle_pinched and not pinky_pinched:
                 self.palm_history.append((palm_x, now))
                 sweep_dir = self._check_palm_sweep(now)
                 if sweep_dir == "NEXT":
                     self.os_ctrl.next_track()
                     self._trigger_cooldown()
-                    return "ACTION: Next Track (Palm Sweep R->L)", None
+                    return "ACTION: Next Track (Palm Sweep R->L)", None, False
                 elif sweep_dir == "PREV":
                     self.os_ctrl.prev_track()
                     self._trigger_cooldown()
-                    return "ACTION: Previous Track (Palm Sweep L->R)", None
+                    return "ACTION: Previous Track (Palm Sweep L->R)", None, False
                 if len(self.palm_history) >= 2:
                     self.last_active_time = now
             else:
@@ -365,21 +399,21 @@ class GestureEngine:
                     if in_top_left:
                         self.os_ctrl.open_brave()
                         self._trigger_cooldown()
-                        return "ACTION: Launch Brave", None
+                        return "ACTION: Launch Brave", None, False
                     elif in_top_right:
                         self.os_ctrl.open_spotify()
                         self._trigger_cooldown()
-                        return "ACTION: Launch Spotify", None
+                        return "ACTION: Launch Spotify", None, False
                     else:
                         self.os_ctrl.play_pause()
                         self._trigger_cooldown()
-                        return "ACTION: Play / Pause", None
+                        return "ACTION: Play / Pause", None, False
 
                 if in_top_left:
-                    return "HOLDING FIST TOP-LEFT (Brave)...", None
+                    return "HOLDING FIST TOP-LEFT (Brave)...", None, False
                 elif in_top_right:
-                    return "HOLDING FIST TOP-RIGHT (Spotify)...", None
-                return "HOLDING FIST (Play/Pause)...", None
+                    return "HOLDING FIST TOP-RIGHT (Spotify)...", None, False
+                return "HOLDING FIST (Play/Pause)...", None, False
             else:
                 self.fist_start = 0.0
 
@@ -387,11 +421,11 @@ class GestureEngine:
             if remaining <= 0:
                 self.state = "IDLE"
                 self.arm_start_time = 0.0
-                return "IDLE (Timed out)", None
+                return "IDLE (Timed out)", None, False
 
-            return f"ARMED ({remaining:.1f}s) | Thumb+Ring=Win | Mid=Bright | Idx=Vol", None
+            return f"ARMED ({remaining:.1f}s) | Thumb+Ring=Win | Mid=Bright | Idx=Vol", None, False
 
-        return "IDLE", None
+        return "IDLE", None, False
 
     def _trigger_cooldown(self):
         self.state = "COOLDOWN"
@@ -428,6 +462,7 @@ def main():
     vol_pct, is_muted = engine.os_ctrl.get_volume_info()
     bright_pct = engine.os_ctrl.get_brightness_info()
     last_sys_poll = 0.0
+    should_quit = False
 
     try:
         while cap.isOpened():
@@ -456,7 +491,7 @@ def main():
 
             if result.hand_landmarks:
                 lm = result.hand_landmarks[0]
-                status, slider_mode = engine.update(lm)
+                status, slider_mode, should_quit = engine.update(lm)
                 for pt in lm:
                     cx, cy = int(pt.x * w), int(pt.y * h)
                     cv2.circle(frame, (cx, cy), 3, (0, 255, 180), -1)
@@ -473,8 +508,14 @@ def main():
                     t_pt = (int(lm[4].x * w), int(lm[4].y * h))
                     rg_pt = (int(lm[16].x * w), int(lm[16].y * h))
                     cv2.line(frame, t_pt, rg_pt, (220, 120, 255), 3)
+                elif slider_mode == "QUIT":
+                    t_pt = (int(lm[4].x * w), int(lm[4].y * h))
+                    pk_pt = (int(lm[20].x * w), int(lm[20].y * h))
+                    cv2.line(frame, t_pt, pk_pt, (80, 80, 255), 3)
             else:
                 engine._release_window_switcher_if_needed()
+                engine.quit_start = 0.0
+                engine.quit_last_seen = 0.0
 
             # Corner launch guides (Top-Left = Brave, Top-Right = Spotify)
             cv2.rectangle(frame, (8, 52), (int(0.28 * w), int(0.35 * h)), (90, 140, 255), 1)
@@ -484,7 +525,7 @@ def main():
             cv2.putText(frame, "SPOTIFY", (int(0.73 * w) + 4, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (90, 220, 120), 1)
 
             active_highlight = any(
-                k in status for k in ("ARMED", "VOLUME", "BRIGHTNESS", "ACTION", "COOLDOWN", "HOLDING", "WINDOW")
+                k in status for k in ("ARMED", "VOLUME", "BRIGHTNESS", "ACTION", "COOLDOWN", "HOLDING", "WINDOW", "HOLD THUMB+PINKY")
             )
             color = (0, 255, 0) if active_highlight else (200, 200, 200)
             cv2.putText(frame, status, (15, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.50, color, 2)
@@ -508,7 +549,7 @@ def main():
                 cv2.putText(frame, f"{bright_pct}%", (b_x - 10, bar_bottom + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 180, 50), 2)
 
             cv2.imshow(win_name, frame)
-            if cv2.waitKey(1) & 0xFF == 27:
+            if should_quit or (cv2.waitKey(1) & 0xFF == 27):
                 break
     finally:
         engine._release_window_switcher_if_needed()
